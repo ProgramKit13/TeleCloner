@@ -75,7 +75,7 @@ async def _safe_send(
 
             # --- Extrai o nome do arquivo original ---
             filename = _extract_filename(msg)
-
+            bio.name = filename
             # --- Envia do buffer em RAM ---
             await client.send_file(
                 dst,
@@ -98,27 +98,36 @@ async def _safe_send(
 
 def _extract_filename(msg: Message) -> str:
     """
-    Tenta extrair o nome + extensão originais:
+    Extrai um nome de arquivo seguro com extensão.
     1) DocumentAttributeFilename (para arquivos, stickers, pdfs, etc.)
     2) msg.file.name (usualmente para fotos com nome)
     3) usa msg.file.ext (extensão) e msg.id como fallback
     """
-    # 1) DocumentAttributeFilename
     media = getattr(msg, "media", None)
     doc = getattr(media, "document", None)
     if doc and getattr(doc, "attributes", None):
         for attr in doc.attributes:
             if isinstance(attr, DocumentAttributeFilename):
-                return attr.file_name
+                name = attr.file_name
+                break
+            else:
+                name = None
+        else:
+                name = None
 
-    # 2) msg.file.name
-    name = getattr(msg.file, "name", None)
+        if not name:
+            name = getattr(msg.file, "name", None)
+
     if name:
-        return name
+        # remove qualquer caminho e espaços estranhos
+        name = str(name).split("/")[-1].split("\\")[-1]
+        if name.strip():
+            return name
 
-    # 3) fallback msg.id + extensão
     ext = getattr(msg.file, "ext", "") or ""
-    return f"{msg.id}{ext}"
+    if ext and not ext.startswith('.'):
+        ext = f'.{ext}'
+    return f"{msg.id}{ext or '.bin'}"
 
 
 def live_mirror(
