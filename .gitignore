@@ -1,1 +1,13 @@
+# Virtualenv
 .venv/
+
+# IDE settings
+.idea/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Arquivos de sessão/Log
+*.session
+*.session-journal
