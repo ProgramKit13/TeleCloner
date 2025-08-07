@@ -13,6 +13,7 @@ from typing import Optional, Callable
 from telethon import TelegramClient, events
 from telethon.tl.types import Message, DocumentAttributeFilename
 from telethon.errors import FloodWaitError
+from telethon.errors.rpcerrorlist import FilePartsInvalidError
 
 
 async def forward_history(
@@ -22,29 +23,40 @@ async def forward_history(
     *,
     topic_id: Optional[int] = None,
     strip_caption: bool = False,
+    resume_id: Optional[int] = None,               # ← voltou
     on_forward: Optional[Callable[[int], None]] = None
 ):
     """
     Encaminha TODO o histórico de `src` → `dst`, **via RAM**.
-    - `topic_id`: filtra dentro de fórum (thread)
-    - `strip_caption`: remove legendas de mídia
-    - `on_forward`: callback(msg_id) após cada mensagem enviada
+    - topic_id: filtra dentro de fórum (thread)
+    - strip_caption: remove legendas de mídia
+    - resume_id: pula mensagens com id <= resume_id
+    - on_forward: callback(msg_id) após cada mensagem enviada
     """
     try:
         async for msg in client.iter_messages(src, reply_to=topic_id, reverse=True):
+            if resume_id is not None and msg.id <= resume_id:
+                continue
+
             caption = "" if strip_caption else (msg.text or "")
-            await _safe_send(client, dst, msg, caption)
-            if on_forward:
-                on_forward(msg.id)
+
+            # Tenta enviar a mensagem; se der FLOOD, espera e tenta de novo.
+            while True:
+                try:
+                    sent = await _safe_send(client, dst, msg, caption)
+                    if sent and on_forward:
+                        on_forward(msg.id)
+                    break
+                except FloodWaitError as e:
+                    print(f"\n⏳ FLOOD WAIT {e.seconds}s — aguardando…")
+                    await asyncio.sleep(e.seconds)
+                except Exception:
+                    print("⚠️ Falha ao enviar esta mensagem; pulando.")
+                    traceback.print_exc(file=sys.stdout)
+                    break
+
         print("✅ Encaminhamento concluído!")
-    except FloodWaitError as e:
-        print(f"\n⏳ FLOOD WAIT {e.seconds}s — aguardando…")
-        await asyncio.sleep(e.seconds)
-        # retoma do ponto onde parou
-        await forward_history(client, src, dst,
-                              topic_id=topic_id,
-                              strip_caption=strip_caption,
-                              on_forward=on_forward)
+
     except Exception:
         print("\n❌ Erro inesperado no encaminhamento:")
         traceback.print_exc(file=sys.stdout)
@@ -55,55 +67,66 @@ async def _safe_send(
     dst,
     msg: Message,
     caption: str
-):
+) -> bool:
     """
-    1) Se houver mídia, faz download para um BytesIO e envia com send_file,
-       passando o `filename` extraído corretamente.
-    2) Se só houver texto, faz send_message.
-    Mensagens completamente vazias são puladas.
+    Envia uma única mensagem:
+      - Se tiver mídia: baixa para bytes → BytesIO → upload_file (part_size) → send_file.
+      - Se só texto: send_message.
+    Retorna True se algo foi enviado; False se a mensagem era vazia.
+    Propaga FloodWaitError para o caller tratar.
     """
-    # pula mensagens sem texto nem mídia
+    # Mensagem sem texto e sem mídia = nada a fazer
     if not msg.media and not caption:
-        return
+        return False
 
     try:
         if msg.media:
-            # --- Baixa pra RAM ---
-            bio = io.BytesIO()
-            await msg.download_media(file=bio)
-            bio.seek(0)
+            # Baixa mídia para bytes (tamanho confiável)
+            data: bytes = await msg.download_media(file=bytes)
+            if not data:
+                print("⚠️ Mídia vazia/indisponível; pulando.")
+                return False
 
-            # --- Extrai o nome do arquivo original ---
+            bio = io.BytesIO(data)
             filename = _extract_filename(msg)
             bio.name = filename
-            # --- Envia do buffer em RAM ---
+            bio.seek(0)
+
+            # Upload explícito (evita FilePartsInvalid)
+            try:
+                handle = await client.upload_file(bio, file_name=filename, part_size_kb=512)
+            except FilePartsInvalidError:
+                bio.seek(0)
+                handle = await client.upload_file(bio, file_name=filename, part_size_kb=256)
+
             await client.send_file(
                 dst,
-                bio,
-                filename=filename,
+                handle,
+                file_name=filename,   # preserva nome e extensão
                 caption=caption,
                 parse_mode="md"
             )
+            return True
+
         else:
-            # só texto
             await client.send_message(dst, caption, parse_mode="md")
+            return True
 
     except FloodWaitError:
-        # repropaga para o caller lidar com flood
         raise
     except Exception:
         print("⚠️ Falha no envio de mensagem/mídia:")
         traceback.print_exc(file=sys.stdout)
+        return False
 
 
 def _extract_filename(msg: Message) -> str:
     """
     Extrai um nome de arquivo seguro com extensão.
     1) DocumentAttributeFilename (para arquivos, stickers, pdfs, etc.)
-    2) msg.file.name (usualmente para fotos com nome)
-    3) usa msg.file.ext (extensão) e msg.id como fallback
+    2) msg.file.name (quando existir)
+    3) fallback: msg.id + .ext (ou .bin)
     """
-    # >>> Correção: inicializa name antes do laço <<<
     name: Optional[str] = None
 
     media = getattr(msg, "media", None)
@@ -114,24 +137,20 @@ def _extract_filename(msg: Message) -> str:
                 name = attr.file_name
                 break
 
-    # se não veio de DocumentAttributeFilename, tenta o nome genérico
     if not name:
-        name = getattr(msg.file, "name", None)
+        name = getattr(getattr(msg, "file", None), "name", None)
 
-    # limpa caminhos e espaços
     if name:
-        safe = name.split("/")[-1].split("\\")[-1].strip()
+        safe = str(name).split("/")[-1].split("\\")[-1].strip()
         if safe:
             return safe
 
-    # fallback: usa msg.id + extensão ou .bin
-    ext = getattr(msg.file, "ext", "") or ""
+    ext = getattr(getattr(msg, "file", None), "ext", "") or ""
     if ext and not ext.startswith('.'):
         ext = f'.{ext}'
     if not ext:
         ext = '.bin'
     return f"{msg.id}{ext}"
-
 
 
 def live_mirror(
@@ -155,10 +174,14 @@ def live_mirror(
         msg: Message = event.message
         caption = "" if strip_caption else (msg.text or "")
         try:
-            await _safe_send(client, dst, msg, caption)
-        except FloodWaitError as e:
-            print(f"\n⏳ FLOOD WAIT {e.seconds}s — aguardando…")
-            await asyncio.sleep(e.seconds)
+            # mesma política de flood do histórico
+            while True:
+                try:
+                    await _safe_send(client, dst, msg, caption)
+                    break
+                except FloodWaitError as e:
+                    print(f"\n⏳ FLOOD WAIT {e.seconds}s — aguardando…")
+                    await asyncio.sleep(e.seconds)
         except Exception:
             print("\n❌ Erro no espelhamento em tempo real:")
             traceback.print_exc(file=sys.stdout)
