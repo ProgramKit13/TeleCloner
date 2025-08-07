@@ -103,6 +103,9 @@ def _extract_filename(msg: Message) -> str:
     2) msg.file.name (usualmente para fotos com nome)
     3) usa msg.file.ext (extensão) e msg.id como fallback
     """
+    # >>> Correção: inicializa name antes do laço <<<
+    name: Optional[str] = None
+
     media = getattr(msg, "media", None)
     doc = getattr(media, "document", None)
     if doc and getattr(doc, "attributes", None):
@@ -110,24 +113,25 @@ def _extract_filename(msg: Message) -> str:
             if isinstance(attr, DocumentAttributeFilename):
                 name = attr.file_name
                 break
-            else:
-                name = None
-        else:
-                name = None
 
-        if not name:
-            name = getattr(msg.file, "name", None)
+    # se não veio de DocumentAttributeFilename, tenta o nome genérico
+    if not name:
+        name = getattr(msg.file, "name", None)
 
+    # limpa caminhos e espaços
     if name:
-        # remove qualquer caminho e espaços estranhos
-        name = str(name).split("/")[-1].split("\\")[-1]
-        if name.strip():
-            return name
+        safe = name.split("/")[-1].split("\\")[-1].strip()
+        if safe:
+            return safe
 
+    # fallback: usa msg.id + extensão ou .bin
     ext = getattr(msg.file, "ext", "") or ""
     if ext and not ext.startswith('.'):
         ext = f'.{ext}'
-    return f"{msg.id}{ext or '.bin'}"
+    if not ext:
+        ext = '.bin'
+    return f"{msg.id}{ext}"
+
 
 
 def live_mirror(
