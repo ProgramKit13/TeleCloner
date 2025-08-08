@@ -61,25 +61,33 @@ async def _choose_dialog(client, papel):
         print("❌ Índice inválido.")
         return None, None
 
-    topic_id = None
+    topic_id = 0 # Adicionado para garantir que o default é "Geral" (0)
     if getattr(ent, "forum", False):
-        topics = await client(GetForumTopicsRequest(
+        topics_res = await client(GetForumTopicsRequest(
             channel      = ent,
             offset_date  = datetime.utcfromtimestamp(0),
             offset_id    = 0,
             offset_topic = 0,
             limit        = 100
         ))
-        if topics.topics:
+        if topics_res.topics:
             print("\n--- Tópicos ---")
-            for j, t in enumerate(topics.topics):
+            # Adicionado o tópico Geral (índice 0) na lista para o usuário
+            print(f"{0:>3}: Geral")
+            for j, t in enumerate(topics_res.topics, start=1):
                 print(f"{j:>3}: {t.title}")
             opt = input("Índice do tópico (vazio = todo grupo): ").strip()
             if opt:
                 try:
-                    topic_id = topics.topics[int(opt)].id
+                    # Ajustado para usar o índice 0-based da lista do usuário
+                    opt_idx = int(opt)
+                    if opt_idx == 0:
+                        topic_id = 0 # Tópico Geral
+                    else:
+                        topic_id = topics_res.topics[opt_idx - 1].id
                 except (ValueError, IndexError):
-                    print("❌ Índice inválido.")
+                    print("❌ Índice inválido. Usando tópico Geral.")
+                    topic_id = 0
     return ent, topic_id
 
 # ───────────────────── Menu principal ─────────────────────
@@ -119,7 +127,8 @@ async def main():
             if op == "1":  # ── CLONAR HISTÓRICO ──
                 src, th_src = await _choose_dialog(client, "ORIGEM")
                 if not src: continue
-                dst, _ = await _choose_dialog(client, "DESTINO")
+                # Alteração: Salvamos o tópico de destino em uma nova variável
+                dst, dst_tid = await _choose_dialog(client, "DESTINO")
                 if not dst: continue
                 strip = input("❓ Remover legendas das mídias? (s/N): ").lower().startswith('s')
 
@@ -133,10 +142,11 @@ async def main():
                         data.get(str(src.id), {}).pop(str(th_src), None)
                         save_cli_checkpoint(data)
 
-                # → chama sem o resume_id, deixando o próprio forward_history gerenciar
+                # → Adicionado o dst_topic_id aqui para encaminhar para o tópico correto
                 await fw.forward_history(
                     client, src, dst,
                     topic_id=th_src,
+                    dst_topic_id=dst_tid, # Alteração: Adicionado o tópico de destino
                     strip_caption=strip,
                     on_forward=lambda mid: update_checkpoint(src.id, th_src, mid)
                 )
@@ -144,11 +154,14 @@ async def main():
             elif op == "2":  # ── ESPELHAR VIVO ──
                 src, th_src = await _choose_dialog(client, "ORIGEM")
                 if not src: continue
-                dst, _ = await _choose_dialog(client, "DESTINO")
+                # Alteração: Salvamos o tópico de destino em uma nova variável
+                dst, dst_tid = await _choose_dialog(client, "DESTINO")
                 if not dst: continue
                 strip = input("❓ Remover legendas ao espelhar? (s/N): ").lower().startswith('s')
+                # Alteração: Adicionado o dst_topic_id aqui para espelhar para o tópico correto
                 fw.live_mirror(client, src, dst,
                                topic_id=th_src,
+                               dst_topic_id=dst_tid, # Alteração: Adicionado o tópico de destino
                                strip_caption=strip)
                 print("🔄 Espelhando… CTRL+C p/ parar.")
                 await client.run_until_disconnected()
