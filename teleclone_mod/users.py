@@ -4,9 +4,10 @@
 
 import asyncio
 import random
+
 from telethon.tl.functions.channels import InviteToChannelRequest
-from telethon.errors import (
-    FloodWaitError,
+from telethon.errors import FloodWaitError
+from telethon.errors.rpcerrorlist import (
     PeerFloodError,
     ChatAdminRequiredError,
     UserPrivacyRestrictedError,
@@ -14,6 +15,7 @@ from telethon.errors import (
     UserChannelsTooMuchError,
     ChannelPrivateError,
 )
+
 
 async def copy_users(client, src, dst, limit=None, base_pause=2.0):
     """
@@ -39,8 +41,9 @@ async def copy_users(client, src, dst, limit=None, base_pause=2.0):
                 await asyncio.sleep(20 + random.random() * 10)
 
         except FloodWaitError as e:
-            print(f"⏳ FloodWait {e.seconds}s — pausando.")
-            await asyncio.sleep(e.seconds)
+            secs = getattr(e, "seconds", None) or 60
+            print(f"⏳ FloodWait {secs}s — pausando.")
+            await asyncio.sleep(secs)
 
         except PeerFloodError:
             print("⛔ PeerFloodError — limite atingido. Pare por algumas horas e tente depois.")

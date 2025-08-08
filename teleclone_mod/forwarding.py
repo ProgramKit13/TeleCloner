@@ -11,7 +11,8 @@ import traceback
 from typing import Optional, Callable
 
 from telethon import TelegramClient, events
-from telethon.tl.types import Message, DocumentAttributeFilename
+from telethon.tl.custom.message import Message
+from telethon.tl.types import DocumentAttributeFilename
 from telethon.errors import FloodWaitError
 from telethon.errors.rpcerrorlist import FilePartsInvalidError
 
@@ -34,7 +35,12 @@ async def forward_history(
     - on_forward: callback(msg_id) após cada mensagem enviada
     """
     try:
-        async for msg in client.iter_messages(src, reply_to=topic_id, reverse=True):
+        # Construção de kwargs para compatibilidade entre versões do Telethon
+        im_kwargs = dict(reverse=True)
+        if topic_id is not None:
+            im_kwargs["reply_to"] = topic_id
+
+        async for msg in client.iter_messages(src, **im_kwargs):
             if resume_id is not None and msg.id <= resume_id:
                 continue
 
@@ -45,11 +51,16 @@ async def forward_history(
                 try:
                     sent = await _safe_send(client, dst, msg, caption)
                     if sent and on_forward:
-                        on_forward(msg.id)
+                        try:
+                            on_forward(msg.id)
+                        except Exception:
+                            # callback do usuário não deve quebrar o loop
+                            pass
                     break
                 except FloodWaitError as e:
-                    print(f"\n⏳ FLOOD WAIT {e.seconds}s — aguardando…")
-                    await asyncio.sleep(e.seconds)
+                    secs = getattr(e, "seconds", None) or 60
+                    print(f"\n⏳ FLOOD WAIT {secs}s — aguardando…")
+                    await asyncio.sleep(secs)
                 except Exception:
                     print("⚠️ Falha ao enviar esta mensagem; pulando.")
                     traceback.print_exc(file=sys.stdout)
@@ -76,11 +87,11 @@ async def _safe_send(
     Propaga FloodWaitError para o caller tratar.
     """
     # Mensagem sem texto e sem mídia = nada a fazer
-    if not msg.media and not caption:
+    if not getattr(msg, "media", None) and not caption:
         return False
 
     try:
-        if msg.media:
+        if getattr(msg, "media", None):
             # Baixa mídia para bytes (tamanho confiável)
             data: bytes = await msg.download_media(file=bytes)
             if not data:
@@ -167,8 +178,7 @@ def live_mirror(
 
     @client.on(events.NewMessage(
         chats=src,
-        func=lambda e: (e.message.reply_to_msg_id == topic_id)
-                       if topic_id is not None else True
+        func=(lambda e: (e.message.reply_to_msg_id == topic_id)) if topic_id is not None else (lambda _e: True)
     ))
     async def _handler(event):
         msg: Message = event.message
@@ -180,8 +190,9 @@ def live_mirror(
                     await _safe_send(client, dst, msg, caption)
                     break
                 except FloodWaitError as e:
-                    print(f"\n⏳ FLOOD WAIT {e.seconds}s — aguardando…")
-                    await asyncio.sleep(e.seconds)
+                    secs = getattr(e, "seconds", None) or 60
+                    print(f"\n⏳ FLOOD WAIT {secs}s — aguardando…")
+                    await asyncio.sleep(secs)
         except Exception:
             print("\n❌ Erro no espelhamento em tempo real:")
             traceback.print_exc(file=sys.stdout)
