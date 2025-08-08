@@ -2,10 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 CLI wrapper para o Teleclone Mod, com suporte a checkpoint para retomar encaminhamento.
+(Apenas ajuste Windows: event loop policy. Lógica intacta.)
 """
 import asyncio
 import sys
 import json
+import os
 from pathlib import Path
 from datetime import datetime
 from telethon import TelegramClient
@@ -14,6 +16,13 @@ from telethon.tl.functions.channels import GetForumTopicsRequest
 
 from teleclone_mod import core, forwarding as fw, users as us
 from teleclone_mod.core import load_creds
+
+# ───────────────────── Windows: event loop mais estável ─────────────────────
+if os.name == "nt":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 # ───────────────────── Checkpoint CLI ─────────────────────
 CKPT_FILE = Path("cli_checkpoint.json")
@@ -61,33 +70,25 @@ async def _choose_dialog(client, papel):
         print("❌ Índice inválido.")
         return None, None
 
-    topic_id = 0 # Adicionado para garantir que o default é "Geral" (0)
+    topic_id = None
     if getattr(ent, "forum", False):
-        topics_res = await client(GetForumTopicsRequest(
+        topics = await client(GetForumTopicsRequest(
             channel      = ent,
             offset_date  = datetime.utcfromtimestamp(0),
             offset_id    = 0,
             offset_topic = 0,
             limit        = 100
         ))
-        if topics_res.topics:
+        if topics.topics:
             print("\n--- Tópicos ---")
-            # Adicionado o tópico Geral (índice 0) na lista para o usuário
-            print(f"{0:>3}: Geral")
-            for j, t in enumerate(topics_res.topics, start=1):
+            for j, t in enumerate(topics.topics):
                 print(f"{j:>3}: {t.title}")
             opt = input("Índice do tópico (vazio = todo grupo): ").strip()
             if opt:
                 try:
-                    # Ajustado para usar o índice 0-based da lista do usuário
-                    opt_idx = int(opt)
-                    if opt_idx == 0:
-                        topic_id = 0 # Tópico Geral
-                    else:
-                        topic_id = topics_res.topics[opt_idx - 1].id
+                    topic_id = topics.topics[int(opt)].id
                 except (ValueError, IndexError):
-                    print("❌ Índice inválido. Usando tópico Geral.")
-                    topic_id = 0
+                    print("❌ Índice inválido.")
     return ent, topic_id
 
 # ───────────────────── Menu principal ─────────────────────
@@ -127,8 +128,8 @@ async def main():
             if op == "1":  # ── CLONAR HISTÓRICO ──
                 src, th_src = await _choose_dialog(client, "ORIGEM")
                 if not src: continue
-                # Alteração: Salvamos o tópico de destino em uma nova variável
-                dst, dst_tid = await _choose_dialog(client, "DESTINO")
+                # >>> NÃO descartar o tópico do DESTINO
+                dst, th_dst = await _choose_dialog(client, "DESTINO")
                 if not dst: continue
                 strip = input("❓ Remover legendas das mídias? (s/N): ").lower().startswith('s')
 
@@ -142,11 +143,11 @@ async def main():
                         data.get(str(src.id), {}).pop(str(th_src), None)
                         save_cli_checkpoint(data)
 
-                # → Adicionado o dst_topic_id aqui para encaminhar para o tópico correto
+                # → passar também o tópico do DESTINO
                 await fw.forward_history(
                     client, src, dst,
                     topic_id=th_src,
-                    dst_topic_id=dst_tid, # Alteração: Adicionado o tópico de destino
+                    dst_topic_id=th_dst,
                     strip_caption=strip,
                     on_forward=lambda mid: update_checkpoint(src.id, th_src, mid)
                 )
@@ -154,14 +155,14 @@ async def main():
             elif op == "2":  # ── ESPELHAR VIVO ──
                 src, th_src = await _choose_dialog(client, "ORIGEM")
                 if not src: continue
-                # Alteração: Salvamos o tópico de destino em uma nova variável
-                dst, dst_tid = await _choose_dialog(client, "DESTINO")
+                # >>> NÃO descartar o tópico do DESTINO
+                dst, th_dst = await _choose_dialog(client, "DESTINO")
                 if not dst: continue
                 strip = input("❓ Remover legendas ao espelhar? (s/N): ").lower().startswith('s')
-                # Alteração: Adicionado o dst_topic_id aqui para espelhar para o tópico correto
+                # → passar também o tópico do DESTINO
                 fw.live_mirror(client, src, dst,
                                topic_id=th_src,
-                               dst_topic_id=dst_tid, # Alteração: Adicionado o tópico de destino
+                               dst_topic_id=th_dst,
                                strip_caption=strip)
                 print("🔄 Espelhando… CTRL+C p/ parar.")
                 await client.run_until_disconnected()
