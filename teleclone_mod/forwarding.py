@@ -8,7 +8,7 @@ Forward/Mirror via RAM — MESMA estratégia do core.py:
 - Ignorar mensagens vazias (sem texto e sem mídia)
 
 Ajustes mínimos:
-- Windows: usa part_size_kb=1024 no upload_file (fallback 512). Linux/macOS seguem 512→256.
+- part_size_kb fixo em 512 (fallback 256 apenas se necessário).
 - Tolerar TypeError do Telethon quando chat não tem fórum (mantém “Geral” ao invés de crashar).
 """
 import asyncio
@@ -48,8 +48,7 @@ async def _get_topics_like_core(client: TelegramClient, chan) -> Dict[int, str]:
             off_id, off_tid, off_date = last.top_message, last.id, last.date
             if len(res.topics) < 100:
                 break
-    except (RPCError, TypeError):  # <— só evita crash em chat/grupo sem fórum
-        # Sem fórum → só Geral
+    except (RPCError, TypeError):  # chat/grupo sem fórum
         pass
     return topics
 
@@ -127,13 +126,11 @@ async def forward_history(
                         bio.name = filename
                         bio.seek(0)
                         try:
-                            # Windows: parte maior; Linux/macOS: mantém 512
-                            ps = 1024 if os.name == "nt" else 512
-                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=ps)
+                            # FIXO 512 KB; fallback 256 só se o servidor recusar
+                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=512)
                         except FilePartsInvalidError:
                             bio.seek(0)
-                            ps = 512 if os.name == "nt" else 256
-                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=ps)
+                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=256)
 
                         await client.send_file(
                             dst,
@@ -216,12 +213,11 @@ def live_mirror(
                         bio.name = filename
                         bio.seek(0)
                         try:
-                            ps = 1024 if os.name == "nt" else 512
-                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=ps)
+                            # FIXO 512 KB; fallback 256 só se necessário
+                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=512)
                         except FilePartsInvalidError:
                             bio.seek(0)
-                            ps = 512 if os.name == "nt" else 256
-                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=ps)
+                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=256)
 
                         await client.send_file(
                             dst,
