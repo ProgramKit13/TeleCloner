@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Forward/Mirror via RAM — MESMA estratégia do core.py:
-- Mapear escolha do usuário -> topic_id como em core.py:get_topics
-- Filtrar origem com reply_to=<topic_id> (apenas se != 0)
-- Postar destino com reply_to=<topic_id> (apenas se != 0)
-- Ignorar mensagens vazias (sem texto e sem mídia)
+Forward/Mirror via RAM — mesma estratégia do core.py:
+- Mapeia escolha do usuário -> topic_id como em core.py:get_topics
+- Filtra ORIGEM com reply_to=<topic_id> (apenas se != 0)
+- Posta DESTINO com reply_to=<topic_id> (apenas se != 0)
+- Ignora mensagens vazias (sem texto e sem mídia)
 
-Ajustes mínimos:
-- part_size_kb fixo em 512 (fallback 256 apenas se necessário).
-- Tolerar TypeError do Telethon quando chat não tem fórum (mantém “Geral” ao invés de crashar).
+Boosts opcionais (NÃO mudam o comportamento se você não setar nada):
+- TC_SPOOL_LIMIT_MB: tamanho do buffer em RAM antes de "derramar" pro disco (default 512 MB)
+- TC_CONCURRENCY: quantidade de uploads simultâneos (default 1 = sequencial, idêntico ao original)
+- part_size_kb fixo em 512 (fallback 256 para compatibilidade)
 """
 import asyncio
 import io
-import sys
 import os
+import sys
+import tempfile
 import traceback
 from typing import Optional, Callable, Dict, Tuple, List
 
@@ -25,9 +27,11 @@ from telethon.tl import functions
 from telethon.tl.custom.message import Message
 from telethon.tl.types import DocumentAttributeFilename
 
+# ───────── Config por ambiente ─────────
+SPOOL_LIMIT = int(os.getenv("TC_SPOOL_LIMIT_MB", "512")) * 1024 * 1024  # 512MB padrão
+CONCURRENCY = max(1, int(os.getenv("TC_CONCURRENCY", "1")))             # 1 = sequencial (igual ao seu)
 
 # ───────────────────── tópicos (idêntico ao core.py) ─────────────────────
-
 async def _get_topics_like_core(client: TelegramClient, chan) -> Dict[int, str]:
     """Retorna {0:'Geral', topic_id:title, ...} na MESMA ordem do core.py."""
     topics: Dict[int, str] = {0: "Geral"}
@@ -80,8 +84,59 @@ async def _resolve_like_core(client: TelegramClient, chat, user_value: Optional[
     raise ValueError(f"Índice/topic_id inválido: {user_value}")
 
 
-# ───────────────────── encaminhamento ─────────────────────
+# ───────────────────── helpers ─────────────────────
+async def _upload_handle(client: TelegramClient, fobj, filename: str):
+    """
+    Faz upload do file-like e retorna o handle (InputFile).
+    Usa part_size_kb=512 (fallback 256 em caso de FilePartsInvalidError).
+    """
+    try:
+        fobj.seek(0)
+    except Exception:
+        pass
+    try:
+        return await client.upload_file(fobj, file_name=filename, part_size_kb=512)
+    except FilePartsInvalidError:
+        fobj.seek(0)
+        return await client.upload_file(fobj, file_name=filename, part_size_kb=256)
 
+
+async def _process_one_message(
+    client: TelegramClient,
+    msg: Message,
+    dst,
+    dst_tid: Optional[int],
+    strip_caption: bool
+):
+    caption = "" if strip_caption else (msg.text or "")
+    if not getattr(msg, "media", None) and not caption:
+        return  # realmente vazia
+
+    if getattr(msg, "media", None):
+        filename = _extract_filename(msg)
+        # spooling: até SPOOL_LIMIT em RAM; maior → arquivo temporário em disco (transparente)
+        with tempfile.SpooledTemporaryFile(max_size=SPOOL_LIMIT, mode="w+b") as sp:
+            await client.download_media(msg, file=sp)
+            handle = await _upload_handle(client, sp, filename)
+
+        await client.send_file(
+            dst,
+            handle,
+            file_name=filename,
+            caption=caption,
+            parse_mode="md",
+            reply_to=(int(dst_tid) if (dst_tid is not None and dst_tid != 0) else None)
+        )
+    else:
+        await client.send_message(
+            dst,
+            caption,
+            parse_mode="md",
+            reply_to=(int(dst_tid) if (dst_tid is not None and dst_tid != 0) else None)
+        )
+
+
+# ───────────────────── encaminhamento ─────────────────────
 async def forward_history(
     client: TelegramClient,
     src,
@@ -94,7 +149,9 @@ async def forward_history(
     on_forward: Optional[Callable[[int], None]] = None
 ):
     """
-    Encaminha TODO o histórico src → dst via RAM, postando no tópico escolhido.
+    Encaminha TODO o histórico src → dst.
+    Padrão: sequencial (CONCURRENCY=1 → igual ao original).
+    Se TC_CONCURRENCY > 1 → processa mensagens em paralelo (ordem de envio pode variar).
     """
     try:
         src_tid = await _resolve_like_core(client, src, topic_id)
@@ -105,65 +162,60 @@ async def forward_history(
         if src_tid and src_tid != 0:
             im_kwargs["reply_to"] = int(src_tid)
 
-        async for msg in client.iter_messages(src, **im_kwargs):
-            if resume_id is not None and msg.id <= resume_id:
-                continue
+        if CONCURRENCY == 1:
+            # Sequencial — idêntico ao seu comportamento atual
+            async for msg in client.iter_messages(src, **im_kwargs):
+                if resume_id is not None and msg.id <= resume_id:
+                    continue
+                while True:
+                    try:
+                        await _process_one_message(client, msg, dst, dst_tid, strip_caption)
+                        if on_forward:
+                            try:
+                                on_forward(msg.id)
+                            except Exception:
+                                pass
+                        break
+                    except FloodWaitError as e:
+                        secs = getattr(e, "seconds", None) or 60
+                        print(f"\n⏳ FLOOD WAIT {secs}s — aguardando…")
+                        await asyncio.sleep(secs)
+                    except Exception:
+                        print("⚠️ Falha ao enviar esta mensagem; pulando.")
+                        traceback.print_exc(file=sys.stdout)
+                        break
+        else:
+            # Paralelo controlado por semáforo (ordem pode variar)
+            sem = asyncio.Semaphore(CONCURRENCY)
+            tasks = []
 
-            caption = "" if strip_caption else (msg.text or "")
-
-            # Skip mensagens realmente vazias (sem texto e sem mídia)
-            if not getattr(msg, "media", None) and not caption:
-                continue
-
-            while True:
-                try:
-                    if getattr(msg, "media", None):
-                        data: bytes = await msg.download_media(file=bytes)
-                        if not data:
-                            break  # mídia indisponível
-                        bio = io.BytesIO(data)
-                        filename = _extract_filename(msg)
-                        bio.name = filename
-                        bio.seek(0)
+            async def worker(m: Message):
+                async with sem:
+                    while True:
                         try:
-                            # FIXO 512 KB; fallback 256 só se o servidor recusar
-                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=512)
-                        except FilePartsInvalidError:
-                            bio.seek(0)
-                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=256)
-
-                        await client.send_file(
-                            dst,
-                            handle,
-                            file_name=filename,
-                            caption=caption,
-                            parse_mode="md",
-                            reply_to=(int(dst_tid) if (dst_tid is not None and dst_tid != 0) else None)
-                        )
-                    else:
-                        # somente texto (não vazio)
-                        await client.send_message(
-                            dst,
-                            caption,
-                            parse_mode="md",
-                            reply_to=(int(dst_tid) if (dst_tid is not None and dst_tid != 0) else None)
-                        )
-
-                    if on_forward:
-                        try:
-                            on_forward(msg.id)
+                            await _process_one_message(client, m, dst, dst_tid, strip_caption)
+                            if on_forward:
+                                try:
+                                    on_forward(m.id)
+                                except Exception:
+                                    pass
+                            break
+                        except FloodWaitError as e:
+                            secs = getattr(e, "seconds", None) or 60
+                            print(f"\n⏳ FLOOD WAIT {secs}s — aguardando…")
+                            await asyncio.sleep(secs)
                         except Exception:
-                            pass
-                    break
+                            print("⚠️ Falha ao enviar esta mensagem; pulando.")
+                            traceback.print_exc(file=sys.stdout)
+                            break
 
-                except FloodWaitError as e:
-                    secs = getattr(e, "seconds", None) or 60
-                    print(f"\n⏳ FLOOD WAIT {secs}s — aguardando…")
-                    await asyncio.sleep(secs)
-                except Exception:
-                    print("⚠️ Falha ao enviar esta mensagem; pulando.")
-                    traceback.print_exc(file=sys.stdout)
-                    break
+            async for msg in client.iter_messages(src, **im_kwargs):
+                if resume_id is not None and msg.id <= resume_id:
+                    continue
+                tasks.append(asyncio.create_task(worker(msg)))
+
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         print("✅ Encaminhamento concluído!")
 
@@ -172,20 +224,19 @@ async def forward_history(
         traceback.print_exc(file=sys.stdout)
 
 
-# ───────────────────── espelhamento em tempo real (mesma regra) ─────────────────────
-
+# ───────────────────── espelhamento em tempo real ─────────────────────
 def live_mirror(
     client: TelegramClient,
     src,
     dst,
     *,
-    topic_id: Optional[int] = None,       # índice OU topic_id
-    dst_topic_id: Optional[int] = None,   # índice OU topic_id
+    topic_id: Optional[int] = None,
+    dst_topic_id: Optional[int] = None,
     strip_caption: bool = False
 ):
     """
     Espelha src → dst em tempo real. Posta no tópico com reply_to=<topic_id> se != 0.
-    (sem InputReplyToMessage, sem top_msg_id)
+    Mantém envio 1 a 1 (tempo real) para preservar ordem.
     """
     _dst_tid: Optional[int] = None
 
@@ -198,26 +249,16 @@ def live_mirror(
     @client.on(events.NewMessage(chats=src))
     async def _handler(event):
         caption = "" if strip_caption else (event.message.text or "")
-        # pular mensagens vazias
         if not getattr(event.message, "media", None) and not caption:
             return
         try:
             while True:
                 try:
                     if getattr(event.message, "media", None):
-                        data: bytes = await event.message.download_media(file=bytes)
-                        if not data:
-                            return
-                        bio = io.BytesIO(data)
                         filename = _extract_filename(event.message)
-                        bio.name = filename
-                        bio.seek(0)
-                        try:
-                            # FIXO 512 KB; fallback 256 só se necessário
-                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=512)
-                        except FilePartsInvalidError:
-                            bio.seek(0)
-                            handle = await client.upload_file(bio, file_name=filename, part_size_kb=256)
+                        with tempfile.SpooledTemporaryFile(max_size=SPOOL_LIMIT, mode="w+b") as sp:
+                            await event.message.download_media(file=sp)
+                            handle = await _upload_handle(client, sp, filename)
 
                         await client.send_file(
                             dst,
@@ -245,7 +286,6 @@ def live_mirror(
 
 
 # ───────────────────── util: nome de arquivo ─────────────────────
-
 def _extract_filename(msg: Message) -> str:
     name: Optional[str] = None
     media = getattr(msg, "media", None)

@@ -2,14 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 CLI wrapper para o Teleclone Mod, com suporte a checkpoint para retomar encaminhamento.
-(Apenas ajuste Windows: event loop policy. Lógica intacta.)
+(Apenas correção: passar o tópico do DESTINO para o forwarding/live_mirror.)
 """
+
 import asyncio
 import sys
 import json
 import os
 from pathlib import Path
 from datetime import datetime
+
 from telethon import TelegramClient
 from telethon.tl.types import Channel, Chat
 from telethon.tl.functions.channels import GetForumTopicsRequest
@@ -17,7 +19,7 @@ from telethon.tl.functions.channels import GetForumTopicsRequest
 from teleclone_mod import core, forwarding as fw, users as us
 from teleclone_mod.core import load_creds
 
-# ───────────────────── Windows: event loop mais estável ─────────────────────
+# ───────────────────── Windows: event loop mais estável (não muda lógica) ─────────────────────
 if os.name == "nt":
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -128,8 +130,7 @@ async def main():
             if op == "1":  # ── CLONAR HISTÓRICO ──
                 src, th_src = await _choose_dialog(client, "ORIGEM")
                 if not src: continue
-                # >>> NÃO descartar o tópico do DESTINO
-                dst, th_dst = await _choose_dialog(client, "DESTINO")
+                dst, th_dst = await _choose_dialog(client, "DESTINO")  # <— pega também o tópico do destino
                 if not dst: continue
                 strip = input("❓ Remover legendas das mídias? (s/N): ").lower().startswith('s')
 
@@ -138,31 +139,30 @@ async def main():
                 if last_id:
                     print(f"🔄 Você já encaminhou até a mensagem ID {last_id}.")
                     if input("   Limpar esse ponto e recomeçar do início? (s/N): ").lower().startswith("s"):
-                        # limpa o checkpoint CLI
                         data = load_cli_checkpoint()
                         data.get(str(src.id), {}).pop(str(th_src), None)
                         save_cli_checkpoint(data)
+                        last_id = None  # ← recomeça do zero
 
-                # → passar também o tópico do DESTINO
+                # → agora passa o tópico do DESTINO e o resume_id corretamente
                 await fw.forward_history(
                     client, src, dst,
                     topic_id=th_src,
-                    dst_topic_id=th_dst,
+                    dst_topic_id=th_dst,        # <— correção já existente
                     strip_caption=strip,
+                    resume_id=last_id,          # <— **CORREÇÃO PRINCIPAL**: retomar de onde parou
                     on_forward=lambda mid: update_checkpoint(src.id, th_src, mid)
                 )
 
             elif op == "2":  # ── ESPELHAR VIVO ──
                 src, th_src = await _choose_dialog(client, "ORIGEM")
                 if not src: continue
-                # >>> NÃO descartar o tópico do DESTINO
-                dst, th_dst = await _choose_dialog(client, "DESTINO")
+                dst, th_dst = await _choose_dialog(client, "DESTINO")  # <— correção
                 if not dst: continue
                 strip = input("❓ Remover legendas ao espelhar? (s/N): ").lower().startswith('s')
-                # → passar também o tópico do DESTINO
                 fw.live_mirror(client, src, dst,
                                topic_id=th_src,
-                               dst_topic_id=th_dst,
+                               dst_topic_id=th_dst,  # <— correção
                                strip_caption=strip)
                 print("🔄 Espelhando… CTRL+C p/ parar.")
                 await client.run_until_disconnected()
