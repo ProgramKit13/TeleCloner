@@ -35,8 +35,10 @@ def clear_screen():
 # ───────────────────── 1. CREDENCIAIS ─────────────────────
 
 # ─── Diretório e arquivo de config do usuário ───
-DATA_DIR = Path(user_data_dir(appname="TeleCloner", appauthor="YourCompanyOrName"))
+BASE_DIR = Path(__file__).resolve().parent   # pasta teleclone_mod
+DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 CRED_FILE = DATA_DIR / "creds.json"
 
 def load_creds() -> Tuple[int,str,str]:
