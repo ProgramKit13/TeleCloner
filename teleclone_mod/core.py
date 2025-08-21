@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# teleclone_mod/core.py
+# core.py — Telecloner (menus legíveis + busca; mídia enviada como mídia)
 
 import asyncio
 import os
@@ -15,7 +15,7 @@ import getpass
 import re
 
 from pathlib import Path
-from typing import Dict, Optional, Any, Tuple
+from typing import Dict, Optional, Any, Tuple, List
 from datetime import datetime, timezone
 from tkinter import Tk, filedialog
 from bs4 import BeautifulSoup
@@ -23,25 +23,25 @@ from telethon.errors import RPCError, FloodWaitError
 from telethon.tl.functions.channels import GetForumTopicsRequest
 from telethon.tl.types import Channel, Message
 from telethon import TelegramClient
-from appdirs import user_data_dir
-
-
 
 # ───────────────────── 0. UTILITÁRIOS ─────────────────────
 def clear_screen():
     """Limpa a tela do terminal."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
-# ───────────────────── 1. CREDENCIAIS ─────────────────────
+def pause(msg="Pressione ENTER para continuar..."):
+    try:
+        input(msg)
+    except (EOFError, KeyboardInterrupt):
+        pass
 
-# ─── Diretório e arquivo de config do usuário ───
-BASE_DIR = Path(__file__).resolve().parent   # pasta teleclone_mod
+# ───────────────────── 1. CREDENCIAIS ─────────────────────
+BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 CRED_FILE = DATA_DIR / "creds.json"
 
-def load_creds() -> Tuple[int,str,str]:
+def load_creds() -> Tuple[int, str, str]:
     if CRED_FILE.exists():
         d = json.loads(CRED_FILE.read_text("utf-8"))
         return d["api_id"], d["api_hash"], d["session"]
@@ -59,24 +59,17 @@ def load_creds() -> Tuple[int,str,str]:
     print(f"✅ Credenciais salvas em {CRED_FILE}\n")
     return api_id, api_hash, session
 
-# agora você faz exatamente como antes:
 api_id, api_hash, session_name = load_creds()
 
-
-# ───────────────────── 2. SELETOR DE PASTA ─────────────────────
-def ask_directory() -> Path | None:
-    """Abre um seletor de pasta e devolve Path ou None se cancelar."""
-    Tk().withdraw()
-    folder = filedialog.askdirectory()
-    return Path(folder) if folder else None
-
-# ───────────────────── 3. CONFIGS ─────────────────────
+# ───────────────────── 2. CONFIGS GERAIS ─────────────────────
 CHECKPOINT_FILE = "checkpoint.json"
-BAR_LEN, SLOTS = 30, 5        # largura da barra / downloads simultâneos
-DELAY_BETWEEN_UPLOADS = 2     # segundos entre envios
+BAR_LEN, SLOTS = 30, 5
+DELAY_BETWEEN_UPLOADS = 2
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".3gp", ".avi"}
+AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".flac", ".wav"}
 
-# ─────────────── 4. HTML TEMPLATE ───────────────
+# ─────────────── 3. HTML TEMPLATE ───────────────
 HTML_HEAD_TPL = (
     "<!DOCTYPE html><html lang='pt-br'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -98,14 +91,16 @@ HTML_HEAD_TPL = (
 )
 HTML_FOOT = "</div></body></html>"
 
-# ───────────────────── 5. GLOBAIS ─────────────────────
+# ───────────────────── 4. GLOBAIS DE PROGRESSO ─────────────────────
 dl_size = dl_done = 0
 time_start = time.time()
 bar_lock = asyncio.Lock()
 
-# ───────────────────── 6. AUXILIARES ─────────────────────
+# ───────────────────── 5. AUXILIARES ─────────────────────
 def sanitize(t: str, n: int = 150) -> str:
-    return re.sub(r"[^\w\s\-.()]+", "_", t).strip()[:n] or "sem_nome"
+    s = re.sub(r"[^\w\s\-.()]+", "_", t).strip()
+    s = re.sub(r"\s+", " ", s)
+    return (s[:n] or "sem_nome").strip()
 
 def permalink(ent: Channel, mid: int) -> str:
     return (
@@ -125,59 +120,125 @@ def save_ckpt(path: Path, ck: Dict):
     with contextlib.suppress(Exception):
         (path / CHECKPOINT_FILE).write_text(json.dumps(ck, ensure_ascii=False, indent=2))
 
-def ask_float(prompt):
-    try:
-        s = input(prompt)
-    except (EOFError, KeyboardInterrupt):
-        return None
-    try:
-        return float(s.replace(',', '.'))
-    except:
-        return None
+def ask_directory() -> Optional[Path]:
+    Tk().withdraw()
+    folder = filedialog.askdirectory()
+    return Path(folder) if folder else None
 
-def extract_media_path(div, src_folder: str) -> Optional[str]:
-    a = div.find('a', href=re.compile(r'^media/'))
-    if a:
-        full = Path(src_folder) / a['href']
-        return str(full) if full.exists() else None
-    return None
+# ───────────────────── 6. LISTAGEM LEGÍVEL + BUSCA ─────────────────────
+def _paginate(items: List[Any], per_page: int, page: int) -> Tuple[List[Any], int]:
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    i0 = (page - 1) * per_page
+    i1 = i0 + per_page
+    return items[i0:i1], total_pages
 
-def extract_message_id(div) -> Optional[str]:
-    a = div.find('a', href=re.compile(r't\.me/'))
-    if a and a['href'].rstrip('/').split('/')[-1].isdigit():
-        return a['href'].split('/')[-1]
-    return None
-
-def clean_message_content_for_upload(content_div):
-    for btn in content_div.find_all('a', class_='btn'):
-        btn.decompose()
-    return content_div
-
-def _print_columns(lines, gap=4):
-    cols = shutil.get_terminal_size((120, 20)).columns
-    col_w = (cols - gap) // 2
-    for i in range(0, len(lines), 2):
-        left = lines[i]
-        right = lines[i + 1] if i + 1 < len(lines) else ''
-        print(f"{left.ljust(col_w)}{' ' * gap}{right}")
-
-async def select_dialog(client: TelegramClient, prompt: str) -> Optional[Any]:
-    """Lista os diálogos e retorna o escolhido pelo usuário."""
+def _print_header(title: str, subtitle: Optional[str] = None):
     clear_screen()
-    dialogs = [d.entity for d in await client.get_dialogs(limit=None) if d.is_group or d.is_channel]
-    print('\n' + prompt)
-    _print_columns([f"[{i}] - {g.title}" for i, g in enumerate(dialogs)])
+    print("=" * 72)
+    print(f"{title}".center(72))
+    if subtitle:
+        print(subtitle.center(72))
+    print("=" * 72)
     print()
+
+def _print_list(lines: List[str]):
+    # Mais espaçamento e alinhamento; duas colunas quando couber
+    cols = shutil.get_terminal_size((100, 24)).columns
+    gap = 6
+    if cols >= 100:
+        col_w = (cols - gap) // 2
+        for i in range(0, len(lines), 2):
+            left = lines[i]
+            right = lines[i + 1] if i + 1 < len(lines) else ""
+            print(left.ljust(col_w) + (" " * gap) + right)
+    else:
+        for ln in lines:
+            print(ln)
+    print()
+
+async def list_dialogs(client: TelegramClient) -> List[Any]:
+    # Apenas grupos e canais (inclui supergrupos)
+    dialogs = [d for d in await client.get_dialogs(limit=None) if (d.is_group or d.is_channel)]
+    # Ordena por título “humanizado”
+    def _name(d):
+        ent = d.entity
+        return (getattr(ent, "title", None) or getattr(ent, "username", "") or str(ent.id)).lower()
+    dialogs.sort(key=_name)
+    return dialogs
+
+def _title_of_dialog(d) -> str:
+    ent = d.entity
+    title = getattr(ent, "title", None) or getattr(ent, "username", None) or str(ent.id)
+    return str(title)
+
+async def select_dialog_with_search(client: TelegramClient, prompt_title: str) -> Optional[Any]:
+    """
+    Lista chats/grupos/canais com:
+      • paginação (20 por página)
+      • busca case-insensitive por título (digite '/texto')
+      • voltar com 'b'
+    Retorna o objeto Dialog.entity selecionado ou None ao voltar/cancelar.
+    """
+    per_page = 20
+    dialogs = await list_dialogs(client)
+    filtered = dialogs[:]  # lista corrente (pode ser reduzida pela busca)
+    page = 1
+
     while True:
+        _print_header(prompt_title, "Digite NÚMERO para selecionar • '/texto' para buscar • n/p para navegar • b para voltar")
+        show, total_pages = _paginate(filtered, per_page, page)
+        if not show:
+            print("Nenhum chat/grupo encontrado.\n")
+        lines = []
+        base_idx = (page - 1) * per_page
+        for i, d in enumerate(show, 1):
+            idx = base_idx + i
+            name = sanitize(_title_of_dialog(d), 60)
+            lines.append(f"[{idx:3d}]  {name}")
+        _print_list(lines)
+        print(f"Página {page}/{total_pages}\n")
+
         try:
-            s = input("➡️  NÚMERO do diálogo (Enter=cancelar): ")
-            if not s:
-                return None
-            return dialogs[int(s)]
-        except (ValueError, IndexError):
-            print("❌ Escolha inválida.")
-        except (KeyboardInterrupt, EOFError):
+            s = input("➡️  Escolha: ").strip()
+        except (EOFError, KeyboardInterrupt):
             return None
+
+        if not s:
+            # ENTER cancela (voltar)
+            return None
+
+        if s.lower() in ("b", "voltar"):
+            return None
+        if s.lower() in ("n", "next", ">"):
+            if page < total_pages: page += 1
+            continue
+        if s.lower() in ("p", "prev", "<"):
+            if page > 1: page -= 1
+            continue
+        if s.startswith("/"):
+            term = s[1:].strip().lower()
+            if not term:
+                filtered = dialogs[:]
+            else:
+                filtered = [d for d in dialogs if term in _title_of_dialog(d).lower()]
+            page = 1
+            continue
+        if s.isdigit():
+            sel = int(s)
+            i0 = (page - 1) * per_page
+            # Permite selecionar tanto pelo índice global mostrado quanto pelo relativo na página
+            if i0 < sel <= i0 + len(show):
+                return show[sel - i0 - 1].entity
+            # fallback: seleção absoluta na lista filtrada
+            if 1 <= sel <= len(filtered):
+                return filtered[sel - 1].entity
+            print("❌ Índice fora do intervalo.")
+            pause()
+            continue
+
+        print("❌ Entrada inválida. Use número, '/busca', n/p, ou 'b' para voltar.")
+        pause()
 
 async def get_topics(client: TelegramClient, chan: Channel) -> Dict[int, str]:
     topics = {0: "Geral"}
@@ -193,12 +254,83 @@ async def get_topics(client: TelegramClient, chan: Channel) -> Dict[int, str]:
             if not res.topics:
                 break
             for t in res.topics:
-                topics[t.id] = t.title or f"Tópico {t.id}"
+                topics[int(t.id)] = t.title or f"Tópico {t.id}"
             last = res.topics[-1]
-            off_id, off_tid, off_date = last.top_message, last.id, last.date
+            off_id, off_tid, off_date = last.top_message, int(last.id), last.date
+            if len(res.topics) < 100:
+                break
     except RPCError:
         pass
     return topics
+
+async def select_topic_with_search(client: TelegramClient, chan: Channel, prompt_title: str) -> Tuple[int, str]:
+    """
+    Seleciona tópico com:
+      • paginação (20 por página)
+      • busca '/texto'
+      • opção 'b' para voltar (retorna (0,'Geral') como padrão)
+    Retorna (topic_id, topic_title).
+    """
+    tops = await get_topics(client, chan)
+    items: List[Tuple[int, str]] = list(tops.items())  # [(id, title), ...]
+    # Ordena por título, mantendo Geral (0) no topo
+    base = [(tid, tname) for tid, tname in items if tid != 0]
+    base.sort(key=lambda x: (x[1] or "").lower())
+    items = [(0, "Geral")] + base
+
+    per_page = 20
+    filtered = items[:]  # pode sofrer busca
+    page = 1
+
+    while True:
+        _print_header(prompt_title, "Digite NÚMERO • '/texto' para buscar • n/p para navegar • b para voltar")
+        show, total_pages = _paginate(filtered, per_page, page)
+        if not show:
+            print("Nenhum tópico encontrado.\n")
+        lines = []
+        base_idx = (page - 1) * per_page
+        for i, (tid, tname) in enumerate(show, 1):
+            idx = base_idx + i
+            lines.append(f"[{idx:3d}]  {sanitize(tname, 60)}  (id={tid})")
+        _print_list(lines)
+        print(f"Página {page}/{total_pages}\n")
+
+        try:
+            s = input("➡️  Escolha: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return (0, "Geral")
+
+        if not s:
+            return (0, "Geral")
+        if s.lower() in ("b", "voltar"):
+            return (0, "Geral")
+        if s.lower() in ("n", "next", ">"):
+            if page < total_pages: page += 1
+            continue
+        if s.lower() in ("p", "prev", "<"):
+            if page > 1: page -= 1
+            continue
+        if s.startswith("/"):
+            term = s[1:].strip().lower()
+            if not term:
+                filtered = items[:]
+            else:
+                filtered = [(tid, tname) for (tid, tname) in items if term in (tname or "").lower()]
+            page = 1
+            continue
+        if s.isdigit():
+            sel = int(s)
+            i0 = (page - 1) * per_page
+            if i0 < sel <= i0 + len(show):
+                return show[sel - i0 - 1]
+            if 1 <= sel <= len(filtered):
+                return filtered[sel - 1]
+            print("❌ Índice fora do intervalo.")
+            pause()
+            continue
+
+        print("❌ Entrada inválida. Use número, '/busca', n/p, ou 'b' para voltar.")
+        pause()
 
 # ───────────────────── 7. BARRA DE PROGRESSO ─────────────────────
 async def refresh_download_bar(topic: str):
@@ -418,7 +550,7 @@ async def export_topic(client: TelegramClient, grp: Channel, tid: Optional[int],
     print("\n✅ Download concluído!\n")
     return tdir
 
-# ───────────────────── 9. UPLOAD – prefixo removido e escolha de início ─────────────────────
+# ───────────────────── 9. UPLOAD – envia mídia como mídia ─────────────────────
 async def upload_from_export(client: TelegramClient, src_folder: Path,
                              dest_grp: Channel, dest_tid: Optional[int]):
     print("\n" + "=" * 60)
@@ -444,8 +576,8 @@ async def upload_from_export(client: TelegramClient, src_folder: Path,
             return
         start_idx = next(
             (i for i, div in enumerate(msgs)
-             if (mp := extract_media_path(div, str(src_folder)))
-             and int(Path(mp).name.split("_", 1)[0]) == start_pref),
+             if (mp := _extract_media_path(div, str(src_folder)))
+             and int(Path(mp).name.split('_', 1)[0]) == start_pref),
             None
         )
         if start_idx is None:
@@ -460,16 +592,19 @@ async def upload_from_export(client: TelegramClient, src_folder: Path,
 
     for i, div in enumerate(to_send, 1):
         abs_idx = start_idx + i
-        media_path = extract_media_path(div, str(src_folder))
+        media_path = _extract_media_path(div, str(src_folder))
         content_div = div.find("div", class_="content")
         text = ""
         if content_div:
-            text = html.unescape(clean_message_content_for_upload(content_div).get_text("\n").strip())
+            text = html.unescape(_clean_message_content_for_upload(content_div).get_text("\n").strip())
 
         try:
             if media_path:
                 original_name = Path(media_path).name
                 clean_name = re.sub(r'^\d+_', '', original_name)
+                ext = Path(clean_name).suffix.lower()
+                is_video = ext in VIDEO_EXTS
+
                 sys.stdout.write(f"\r📤 [{i}/{total}] {clean_name[:30]:30} ...")
                 sys.stdout.flush()
                 await client.send_file(
@@ -478,6 +613,8 @@ async def upload_from_export(client: TelegramClient, src_folder: Path,
                     filename=clean_name,
                     caption=text,
                     parse_mode="md",
+                    force_document=False,          # ← mídia quando aplicável
+                    supports_streaming=is_video,   # ← vídeos com player
                     **extra
                 )
             elif text:
@@ -502,6 +639,19 @@ async def upload_from_export(client: TelegramClient, src_folder: Path,
                 break
 
     print("\n🎉 UPLOAD CONCLUÍDO!")
+
+# helpers de leitura/HTML
+def _extract_media_path(div, src_folder: str) -> Optional[str]:
+    a = div.find('a', href=re.compile(r'^media/'))
+    if a:
+        full = Path(src_folder) / a['href']
+        return str(full) if full.exists() else None
+    return None
+
+def _clean_message_content_for_upload(content_div):
+    for btn in content_div.find_all('a', class_='btn'):
+        btn.decompose()
+    return content_div
 
 # ───────────────────── 10. ATUALIZAR chat.html ─────────────────────
 def update_chat_html(folder: Path):
@@ -554,7 +704,7 @@ def update_chat_html(folder: Path):
     print(f"\n✅ chat.html atualizado "
           f"(links criados: {criados}, thumbs: {thumbs}, ausentes: {faltando})\n")
 
-# ───────────────────── 11. FUNÇÃO PRINCIPAL ─────────────────────
+# ───────────────────── 11. MENU PRINCIPAL ─────────────────────
 async def main(client: TelegramClient | None = None):
     """
     • Se 'client' for None → cria e gerencia o próprio cliente.
@@ -572,14 +722,14 @@ async def main(client: TelegramClient | None = None):
       / /        \ \
       | |  ____  | |
      _| |_/ __ \_| |_
-   .' |_   
-   '._____ ____ _____.'
-   |     .'____'.     |
-   '.__.'.'    '.'.__.'
-   '.__  | LOCK |  __.'
-   |   '.'.____.'.'   |
-   '.____'.____.'____.'
-   '.________________.'
+    .' |_   
+    '._____ ____ _____.'
+    |     .'____'.     |
+    '.__.'.'    '.'.__.'
+    '.__  | LOCK |  __.'
+    |   '.'.____.'.'   |
+    '.____'.____.'____.'
+    '.________________.'
 
             G R O U P  -  S T E A L E R 
                     !!BY XN30N!!
@@ -595,55 +745,47 @@ async def main(client: TelegramClient | None = None):
             "[3] Enviar por pasta\n"
             "[4] Gerar clone html\n"
             "[5] Atualizar clone html\n"
-            "[0] Voltar\n"
+            "[0] Voltar/Sair\n"
         )
         op = input("➡️  Escolha: ").strip()
 
         if op in {'1', '2'}:
-            src_grp = await select_dialog(client, "📥 ORIGEM:")
+            src_grp = await select_dialog_with_search(client, "📥 SELECIONE A ORIGEM (grupos/canais)")
             if not src_grp:
                 continue
-            tops = await get_topics(client, src_grp)
-            clear_screen()
-            _print_columns([f"[{i}] - {n}" for i, (_, n) in enumerate(tops.items())])
-            tsel = input("Tópico nº (Enter=0): ").strip()
-            if tsel.isdigit() and int(tsel) < len(tops):
-                src_tid, src_name = list(tops.items())[int(tsel)]
-            else:
-                src_tid, src_name = list(tops.items())[0]
-
+            src_tid, src_name = await select_topic_with_search(client, src_grp, "📌 SELECIONE O TÓPICO DA ORIGEM")
             if op == '1':
                 await export_topic(client, src_grp, src_tid, src_name, limit_bytes=0)
+                pause()
             else:
                 await export_topic(client, src_grp, src_tid, src_name, limit_bytes=0)
-                dest_grp = await select_dialog(client, "📤 DESTINO:")
+                dest_grp = await select_dialog_with_search(client, "📤 SELECIONE O DESTINO (grupos/canais)")
                 if not dest_grp:
                     continue
-                await upload_from_export(client, Path(sanitize(src_name)), dest_grp, None)
+                dest_tid, _ = await select_topic_with_search(client, dest_grp, "📌 TÓPICO DO DESTINO")
+                await upload_from_export(client, Path(sanitize(src_name)), dest_grp, dest_tid)
+                pause()
 
         elif op == '3':
             p = ask_directory()
             if not p or not (p.is_dir() and (p / "chat.html").exists()):
                 print("❌ Pasta inválida.")
+                pause()
                 continue
-            dest_grp = await select_dialog(client, "📤 DESTINO:")
+            dest_grp = await select_dialog_with_search(client, "📤 SELECIONE O DESTINO (grupos/canais)")
             if not dest_grp:
                 continue
-            await upload_from_export(client, p, dest_grp, None)
+            dest_tid, _ = await select_topic_with_search(client, dest_grp, "📌 TÓPICO DO DESTINO")
+            await upload_from_export(client, p, dest_grp, dest_tid)
+            pause()
 
         elif op == '4':
-            src_grp = await select_dialog(client, "📥 ORIGEM:")
+            src_grp = await select_dialog_with_search(client, "📥 SELECIONE A ORIGEM (grupos/canais)")
             if not src_grp:
                 continue
-            tops = await get_topics(client, src_grp)
-            clear_screen()
-            _print_columns([f"[{i}] - {n}" for i, (_, n) in enumerate(tops.items())])
-            tsel = input("Tópico nº (Enter=0): ").strip()
-            if tsel.isdigit() and int(tsel) < len(tops):
-                src_tid, src_name = list(tops.items())[int(tsel)]
-            else:
-                src_tid, src_name = list(tops.items())[0]
+            src_tid, src_name = await select_topic_with_search(client, src_grp, "📌 SELECIONE O TÓPICO DA ORIGEM")
             await generate_html_only(client, src_grp, src_tid, src_name)
+            pause()
 
         elif op == '5':
             folder = ask_directory()
@@ -651,12 +793,13 @@ async def main(client: TelegramClient | None = None):
                 update_chat_html(folder)
             else:
                 print("❌ Pasta inválida.")
+            pause()
 
         elif op == '0':
             break
-
         else:
             print("❌ Opção inválida.")
+            pause()
 
     if close_when_done:
         await client.disconnect()
