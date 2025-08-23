@@ -11,11 +11,15 @@ Notas de envio de mídia (correção iOS):
 - Para vídeos preservamos mime_type, attributes (DocumentAttributeVideo, etc.)
   e passamos supports_streaming=True, force_document=False e miniatura (thumb).
 - Para fotos/áudios/documentos normais, o Telethon já identifica corretamente.
+
+Novidade:
+- Barra de progresso geral no encaminhamento de histórico (%, msgs/s, ETA)
 """
 import asyncio
 import os
 import sys
 import tempfile
+import time
 import traceback
 from typing import Optional, Callable, Dict, Tuple, List
 
@@ -33,6 +37,35 @@ from telethon.tl.types import (
 SPOOL_LIMIT = int(os.getenv("TC_SPOOL_LIMIT_MB", "512")) * 1024 * 1024  # 512MB padrão
 CONCURRENCY = max(1, int(os.getenv("TC_CONCURRENCY", "1")))             # 1 = sequencial (igual ao seu)
 
+# ───────────────────── util da barra ─────────────────────
+def _make_total_bar(prefix: str, total: int, width: int = 34):
+    """
+    Barra total baseada em contagem de mensagens.
+    Retorna (update(done:int), close(ok:bool)).
+    """
+    start = time.time()
+
+    def _fmt(done: int):
+        pct = (done / total * 100) if total else 0.0
+        filled = int(width * pct / 100)
+        bar = '█' * filled + '░' * (width - filled)
+        elapsed = max(1e-6, time.time() - start)
+        speed = done / elapsed  # msgs/s
+        remain = max(0, total - done)
+        eta = remain / speed if speed > 0 else 0.0
+        h, m = int(eta // 3600), int((eta % 3600) // 60)
+        s = int(eta % 60)
+        return f"\r{prefix[:26]:26} │{bar}│ {pct:6.2f}%  {speed:5.2f} msg/s  ETA {h:02d}:{m:02d}:{s:02d}"
+
+    def update(done: int):
+        sys.stdout.write(_fmt(done))
+        sys.stdout.flush()
+
+    def close(ok: bool = True):
+        sys.stdout.write(" ✅\n" if ok else " ❌\n")
+        sys.stdout.flush()
+
+    return update, close
 
 # ───────────────────── tópicos (idêntico ao core.py) ─────────────────────
 async def _get_topics_like_core(client: TelegramClient, chan) -> Dict[int, str]:
@@ -58,7 +91,6 @@ async def _get_topics_like_core(client: TelegramClient, chan) -> Dict[int, str]:
         pass
     return topics
 
-
 async def _resolve_like_core(client: TelegramClient, chat, user_value: Optional[int]) -> Optional[int]:
     if user_value is None:
         return None
@@ -78,7 +110,6 @@ async def _resolve_like_core(client: TelegramClient, chat, user_value: Optional[
 
     raise ValueError(f"Índice/topic_id inválido: {user_value}")
 
-
 # ───────────────────── helpers ─────────────────────
 async def _upload_handle(client: TelegramClient, fobj, filename: str):
     """Upload com part_size_kb ajustável e fallback para compatibilidade."""
@@ -92,7 +123,6 @@ async def _upload_handle(client: TelegramClient, fobj, filename: str):
         fobj.seek(0)
         return await client.upload_file(fobj, file_name=filename, part_size_kb=256)
 
-
 def _is_video(msg: Message) -> bool:
     doc = getattr(getattr(msg, "media", None), "document", None)
     if not doc:
@@ -101,7 +131,6 @@ def _is_video(msg: Message) -> bool:
         return True
     mt = getattr(doc, "mime_type", "") or ""
     return mt.startswith("video/")  # fallback
-
 
 async def _build_send_kwargs_for_media(client: TelegramClient, msg: Message, filename: str) -> dict:
     """
@@ -142,7 +171,6 @@ async def _build_send_kwargs_for_media(client: TelegramClient, msg: Message, fil
 
     return kwargs
 
-
 def _extract_filename(msg: Message) -> str:
     """Nome “seguro” com fallback de extensão."""
     name: Optional[str] = None
@@ -167,7 +195,7 @@ def _extract_filename(msg: Message) -> str:
         ext = '.mp4' if _is_video(msg) else '.bin'
     return f"{msg.id}{ext}"
 
-
+# ───────────────────── processamento (1 msg) ─────────────────────
 async def _process_one_message(
     client: TelegramClient,
     msg: Message,
@@ -205,7 +233,6 @@ async def _process_one_message(
             reply_to=reply_to
         )
 
-
 # ───────────────────── encaminhamento ─────────────────────
 async def forward_history(
     client: TelegramClient,
@@ -218,27 +245,69 @@ async def forward_history(
     resume_id: Optional[int] = None,
     on_forward: Optional[Callable[[int], None]] = None
 ):
+    """
+    Encaminha o histórico de mensagens com barra de progresso geral.
+    A barra reflete *mensagens processadas* (enviadas/puladas/falhas).
+    """
     try:
         src_tid = await _resolve_like_core(client, src, topic_id)
         dst_tid = await _resolve_like_core(client, dst, dst_topic_id)
 
+        # Filtro base
         im_kwargs = dict(reverse=True)
         if src_tid and src_tid != 0:
             im_kwargs["reply_to"] = int(src_tid)
+
+        # ── Passo 1: contar quantas mensagens serão consideradas ──
+        total = 0
+        async for m in client.iter_messages(src, **im_kwargs):
+            if resume_id is not None and m.id <= resume_id:
+                continue
+            cap = "" if strip_caption else (m.text or "")
+            if getattr(m, "media", None) or cap:
+                total += 1
+
+        update_bar, close_bar = _make_total_bar("Encaminhando", total)
+        done = 0
+        lock = asyncio.Lock()  # p/ CONCURRENCY>1
+
+        # ── Passo 2: processar de fato ──
+        async def _tick():
+            nonlocal done
+            async with lock:
+                done += 1
+                update_bar(done)
 
         if CONCURRENCY == 1:
             async for msg in client.iter_messages(src, **im_kwargs):
                 if resume_id is not None and msg.id <= resume_id:
                     continue
-                while True:
+                try:
+                    await _process_one_message(client, msg, dst, dst_tid, strip_caption)
+                    if on_forward:
+                        try: on_forward(msg.id)
+                        except Exception: pass
+                except FloodWaitError as e:
+                    secs = getattr(e, "seconds", None) or 60
+                    print(f"\n⏳ FLOOD WAIT {secs}s — aguardando…")
+                    await asyncio.sleep(secs)
+                except Exception:
+                    print("⚠️ Falha ao enviar esta mensagem; pulando.")
+                    traceback.print_exc(file=sys.stdout)
+                finally:
+                    await _tick()
+
+        else:
+            sem = asyncio.Semaphore(CONCURRENCY)
+            tasks = []
+
+            async def worker(m: Message):
+                async with sem:
                     try:
-                        await _process_one_message(client, msg, dst, dst_tid, strip_caption)
+                        await _process_one_message(client, m, dst, dst_tid, strip_caption)
                         if on_forward:
-                            try:
-                                on_forward(msg.id)
-                            except Exception:
-                                pass
-                        break
+                            try: on_forward(m.id)
+                            except Exception: pass
                     except FloodWaitError as e:
                         secs = getattr(e, "seconds", None) or 60
                         print(f"\n⏳ FLOOD WAIT {secs}s — aguardando…")
@@ -246,45 +315,27 @@ async def forward_history(
                     except Exception:
                         print("⚠️ Falha ao enviar esta mensagem; pulando.")
                         traceback.print_exc(file=sys.stdout)
-                        break
-        else:
-            sem = asyncio.Semaphore(CONCURRENCY)
-            tasks = []
-
-            async def worker(m: Message):
-                async with sem:
-                    while True:
-                        try:
-                            await _process_one_message(client, m, dst, dst_tid, strip_caption)
-                            if on_forward:
-                                try:
-                                    on_forward(m.id)
-                                except Exception:
-                                    pass
-                            break
-                        except FloodWaitError as e:
-                            secs = getattr(e, "seconds", None) or 60
-                            print(f"\n⏳ FLOOD WAIT {secs}s — aguardando…")
-                            await asyncio.sleep(secs)
-                        except Exception:
-                            print("⚠️ Falha ao enviar esta mensagem; pulando.")
-                            traceback.print_exc(file=sys.stdout)
-                            break
+                    finally:
+                        await _tick()
 
             async for msg in client.iter_messages(src, **im_kwargs):
                 if resume_id is not None and msg.id <= resume_id:
+                    continue
+                # aplica mesmo critério de contagem (mensagens “vazias” já foram excluídas no total)
+                cap = "" if strip_caption else (msg.text or "")
+                if not getattr(msg, "media", None) and not cap:
                     continue
                 tasks.append(asyncio.create_task(worker(msg)))
 
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-        print("✅ Encaminhamento concluído!")
+        close_bar(True)
+        print("\n✅ Encaminhamento concluído!\n")
 
     except Exception:
         print("\n❌ Erro inesperado no encaminhamento:")
         traceback.print_exc(file=sys.stdout)
-
 
 # ───────────────────── espelhamento em tempo real ─────────────────────
 def live_mirror(
