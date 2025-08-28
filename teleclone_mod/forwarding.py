@@ -14,6 +14,8 @@ Notas de envio de mídia (correção iOS):
 
 Novidade:
 - Barra de progresso geral no encaminhamento de histórico (%, msgs/s, ETA)
+- Correção FileReferenceExpiredError via recaptura e retentativas
+- Skip de mídia autodestrutiva (TTL)
 """
 import asyncio
 import os
@@ -24,13 +26,14 @@ import traceback
 from typing import Optional, Callable, Dict, Tuple, List
 
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import FloodWaitError, RPCError, FileReferenceExpiredError
 from telethon.errors.rpcerrorlist import FilePartsInvalidError
 from telethon.tl import functions
 from telethon.tl.custom.message import Message
 from telethon.tl.types import (
     DocumentAttributeFilename,
     DocumentAttributeVideo,
+    MessageMediaDocument,
 )
 
 # ───────── Config por ambiente ─────────
@@ -110,7 +113,7 @@ async def _resolve_like_core(client: TelegramClient, chat, user_value: Optional[
 
     raise ValueError(f"Índice/topic_id inválido: {user_value}")
 
-# ───────────────────── helpers ─────────────────────
+# ───────────────────── helpers de robustez ─────────────────────
 async def _upload_handle(client: TelegramClient, fobj, filename: str):
     """Upload com part_size_kb ajustável e fallback para compatibilidade."""
     try:
@@ -120,7 +123,10 @@ async def _upload_handle(client: TelegramClient, fobj, filename: str):
     try:
         return await client.upload_file(fobj, file_name=filename, part_size_kb=512)
     except FilePartsInvalidError:
-        fobj.seek(0)
+        try:
+            fobj.seek(0)
+        except Exception:
+            pass
         return await client.upload_file(fobj, file_name=filename, part_size_kb=256)
 
 def _is_video(msg: Message) -> bool:
@@ -131,6 +137,75 @@ def _is_video(msg: Message) -> bool:
         return True
     mt = getattr(doc, "mime_type", "") or ""
     return mt.startswith("video/")  # fallback
+
+def _has_ttl_media(msg: Message) -> bool:
+    """
+    Detecta mídia autodestrutiva (TTL). Essas não podem ser reenviadas/baixadas novamente.
+    """
+    media = getattr(msg, "media", None)
+    if not media:
+        return False
+    # Fotos/vídeos com ttl_seconds exposto diretamente
+    if hasattr(media, "ttl_seconds") and getattr(media, "ttl_seconds", None):
+        return True
+    # Documentos podem trazer ttl em atributos
+    doc = getattr(media, "document", None)
+    if isinstance(media, MessageMediaDocument) and doc and getattr(doc, "attributes", None):
+        for attr in doc.attributes:
+            if hasattr(attr, "ttl_seconds") and getattr(attr, "ttl_seconds", None):
+                return True
+    return False
+
+async def _safe_refetch_message(client: TelegramClient, msg: Message) -> Message:
+    """
+    Recarrega a mesma mensagem do servidor para renovar o file_reference.
+    """
+    return await client.get_messages(msg.chat_id, ids=msg.id)
+
+async def _safe_download_media(
+    client: TelegramClient,
+    msg: Message,
+    *,
+    file,
+    max_retries: int = 3,
+    retry_sleep: float = 1.5
+):
+    """
+    Faz download com retentativas automáticas.
+    Se o file_reference estiver expirado, recarrega a mensagem e tenta novamente.
+    Trata FloodWait respeitando o tempo informado.
+    """
+    last_err = None
+    cur_msg = msg
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await client.download_media(cur_msg, file=file)
+        except FileReferenceExpiredError as e:
+            last_err = e
+            # recarrega e tenta de novo
+            cur_msg = await _safe_refetch_message(client, cur_msg)
+        except FloodWaitError as e:
+            await asyncio.sleep(getattr(e, "seconds", 1) + 1)
+        except Exception as e:
+            last_err = e
+        await asyncio.sleep(retry_sleep * attempt)
+    if last_err:
+        raise last_err
+
+async def _download_thumb_best_effort(client: TelegramClient, msg: Message):
+    """
+    Tenta baixar uma miniatura (thumb) do documento, mas ignora erros.
+    Retorna bytes ou None.
+    """
+    try:
+        doc = getattr(getattr(msg, "media", None), "document", None)
+        thumbs = getattr(doc, "thumbs", None) or []
+        if not thumbs:
+            return None
+        # usar a menor thumb
+        return await client.download_media(thumbs[0], file=bytes)
+    except Exception:
+        return None
 
 async def _build_send_kwargs_for_media(client: TelegramClient, msg: Message, filename: str) -> dict:
     """
@@ -158,16 +233,10 @@ async def _build_send_kwargs_for_media(client: TelegramClient, msg: Message, fil
         if (mt or "").lower() == "video/mp4" and not filename.lower().endswith(".mp4"):
             kwargs["file_name"] = filename + ".mp4"
 
-        # thumb (se houver)
-        try:
-            thumbs = getattr(doc, "thumbs", None) or []
-            if thumbs:
-                # baixa a menor miniatura para agilizar
-                tbytes = await client.download_media(thumbs[0], file=bytes)
-                if tbytes:
-                    kwargs["thumb"] = tbytes
-        except Exception:
-            pass
+        # thumb (best-effort)
+        tbytes = await _download_thumb_best_effort(client, msg)
+        if tbytes:
+            kwargs["thumb"] = tbytes
 
     return kwargs
 
@@ -207,6 +276,11 @@ async def _process_one_message(
     if not getattr(msg, "media", None) and not caption:
         return  # realmente vazia
 
+    # pular mídia autodestrutiva
+    if getattr(msg, "media", None) and _has_ttl_media(msg):
+        print("⚠️  Mídia com TTL detectada; pulando.")
+        return
+
     reply_to = int(dst_tid) if (dst_tid is not None and dst_tid != 0) else None
 
     if getattr(msg, "media", None):
@@ -214,7 +288,14 @@ async def _process_one_message(
 
         # Spooling: RAM até SPOOL_LIMIT; > derrama pro disco
         with tempfile.SpooledTemporaryFile(max_size=SPOOL_LIMIT, mode="w+b") as sp:
-            await client.download_media(msg, file=sp)
+            try:
+                # download robusto (recaptura se ref expirar)
+                await _safe_download_media(client, msg, file=sp)
+            except FileReferenceExpiredError:
+                # redundante (já tenta recapturar), mas fica como fallback
+                msg = await _safe_refetch_message(client, msg)
+                await _safe_download_media(client, msg, file=sp)
+
             handle = await _upload_handle(client, sp, filename)
 
         send_kwargs = await _build_send_kwargs_for_media(client, msg, filename)
@@ -285,8 +366,10 @@ async def forward_history(
                 try:
                     await _process_one_message(client, msg, dst, dst_tid, strip_caption)
                     if on_forward:
-                        try: on_forward(msg.id)
-                        except Exception: pass
+                        try:
+                            on_forward(msg.id)
+                        except Exception:
+                            pass
                 except FloodWaitError as e:
                     secs = getattr(e, "seconds", None) or 60
                     print(f"\n⏳ FLOOD WAIT {secs}s — aguardando…")
@@ -306,8 +389,10 @@ async def forward_history(
                     try:
                         await _process_one_message(client, m, dst, dst_tid, strip_caption)
                         if on_forward:
-                            try: on_forward(m.id)
-                            except Exception: pass
+                            try:
+                                on_forward(m.id)
+                            except Exception:
+                                pass
                     except FloodWaitError as e:
                         secs = getattr(e, "seconds", None) or 60
                         print(f"\n⏳ FLOOD WAIT {secs}s — aguardando…")
@@ -364,9 +449,19 @@ def live_mirror(
             while True:
                 try:
                     if getattr(event.message, "media", None):
+                        # mídia TTL? pular
+                        if _has_ttl_media(event.message):
+                            print("⚠️  Mídia com TTL detectada (live); pulando.")
+                            break
+
                         filename = _extract_filename(event.message)
                         with tempfile.SpooledTemporaryFile(max_size=SPOOL_LIMIT, mode="w+b") as sp:
-                            await event.message.download_media(file=sp)
+                            try:
+                                await _safe_download_media(client, event.message, file=sp)
+                            except FileReferenceExpiredError:
+                                fresh = await _safe_refetch_message(client, event.message)
+                                await _safe_download_media(client, fresh, file=sp)
+
                             handle = await _upload_handle(client, sp, filename)
 
                         send_kwargs = await _build_send_kwargs_for_media(client, event.message, filename)
