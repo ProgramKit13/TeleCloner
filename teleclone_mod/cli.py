@@ -9,6 +9,10 @@ CLI wrapper para o Teleclone Mod, com:
 - fallback seguro para _print_columns
 - checkpoint para retomar encaminhamento
 - correção: passar o tópico do DESTINO ao encaminhar/espelhar
+
+Correções desta versão:
+- Conflito "p": a busca em tópicos agora usa 's' (ou '/termo') e é checada ANTES da navegação.
+- _fetch_all_topics: explícito q="", e try/except para evitar crash em erro transitório.
 """
 
 import asyncio
@@ -167,13 +171,19 @@ async def _fetch_all_topics(ent) -> List[Tuple[int, str]]:
     off_date = datetime.now(timezone.utc)  # começar do mais novo
 
     while True:
-        res = await client(GetForumTopicsRequest(
-            channel=ent,
-            offset_date=off_date,
-            offset_id=off_id,
-            offset_topic=off_tid,
-            limit=100
-        ))
+        try:
+            res = await client(GetForumTopicsRequest(
+                channel=ent,
+                offset_date=off_date,
+                offset_id=off_id,
+                offset_topic=off_tid,
+                limit=100,
+                q=""  # explícito
+            ))
+        except Exception as e:
+            print(f"⚠️ Falha ao paginar tópicos: {e} — encerrando paginação.")
+            break
+
         if not res.topics:
             break
 
@@ -181,15 +191,16 @@ async def _fetch_all_topics(ent) -> List[Tuple[int, str]]:
             out.append((int(t.id), t.title or f"Tópico {t.id}"))
 
         last = res.topics[-1]
-        off_id = last.top_message
+        off_id  = last.top_message
         off_tid = int(last.id)
         off_date = last.date
 
         if len(res.topics) < 100:
             break
 
-    # ordena alfabeticamente (título), mantendo coerência
+    # ordena alfabeticamente (se quiser a ordem natural do Telegram, comente a linha abaixo)
     out.sort(key=lambda x: (x[1] or "").casefold())
+
     # adiciona "Geral" no topo (id=0)
     return [(0, "Geral")] + out
 
@@ -205,7 +216,7 @@ async def _choose_topic_in_forum(ent, titulo="TÓPICO"):
     UI de seleção de tópico:
       - duas colunas, mais espaço
       - paginação (30 por página)
-      - busca (p / /texto)
+      - busca ('s' ou '/texto')
       - ENTER ou 'b' → volta sem escolher (retorna (None, None))
     Retorna (topic_id, topic_title) ou (None, None).
     """
@@ -233,22 +244,29 @@ async def _choose_topic_in_forum(ent, titulo="TÓPICO"):
             linhas.append(f"[{idx:>3}]  {label}  (id={tid})")
         _print_columns_safe(linhas)
         print(f"Página {page}/{total_pages}")
-        print("Digite número, 'n'/'p' p/ navegar, 'p' ou '/termo' p/ procurar, 'b' ou ENTER p/ voltar.\n")
+        print("Digite número, 'n'/'p' p/ navegar, 's' ou '/termo' p/ procurar, 'b' ou ENTER p/ voltar.\n")
         s = input("Escolha: ").strip()
 
-        if s == "" or s.lower() == "b":
-            return None, None
-        if s.lower() in ("n", ">"):
-            if page < total_pages: page += 1
-            continue
-        if s.lower() in ("p", "<"):
-            if page > 1: page -= 1
-            continue
-        if s.lower() == "p" or s.startswith("/"):
+        # 1) Busca primeiro (evita conflito com 'p' de previous)
+        if s.lower() == "s" or s.startswith("/"):
             term = s[1:] if s.startswith("/") else input("🔎 Título contém: ").strip()
             filtered = _filter_casefold(all_topics, term) if term else all_topics[:]
             page = 1
             continue
+
+        # 2) Voltar / navegação
+        if s == "" or s.lower() == "b":
+            return None, None
+        if s.lower() in ("n", ">"):
+            if page < total_pages:
+                page += 1
+            continue
+        if s.lower() in ("p", "<"):
+            if page > 1:
+                page -= 1
+            continue
+
+        # 3) Seleção por índice
         if s.isdigit():
             sel = int(s)
             i0 = (page - 1) * per_page
